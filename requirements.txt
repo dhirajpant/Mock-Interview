@@ -2,4 +2,6 @@ streamlit
 python-dotenv
 google-generativeai
 PyMuPDF
+langchain
 langchain-core
+langchain-google-genai
