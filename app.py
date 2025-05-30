@@ -1,129 +1,166 @@
-import streamlit as st
-import google.generativeai as genai
 import os
-import json
-import re
+import streamlit as st
 from dotenv import load_dotenv
+import google.generativeai as genai
+import re
+import fitz  # PyMuPDF for PDF resume parsing
+from langchain_core.prompts import PromptTemplate
+from langchain.chains import LLMChain
+from langchain_google_genai import ChatGoogleGenerativeAI
 
-# ---- Load Environment Variables ----
+# Load environment variables
 load_dotenv()
-google_api_key = os.getenv("GOOGLE_API_KEY")
-if not google_api_key:
-    st.error("❌ Google API Key not found. Please check your .env file.")
+api_key = os.getenv("GOOGLE_API_KEY")
+
+if not api_key:
+    st.error("GOOGLE_API_KEY is not set in the environment variables.")
     st.stop()
 
-# ---- Configure Gemini ----
-genai.configure(api_key=google_api_key)
-model = genai.GenerativeModel(model_name="models/gemini-1.5-flash")
+# Configure the Gemini API for LangChain
+try:
+    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=api_key)
+except Exception as e:
+    st.error(f"Failed to initialize language model: {e}")
+    st.stop()
 
-# ---- Session State Initialization ----
-if "questions" not in st.session_state:
-    st.session_state.questions = []
-if "user_answers" not in st.session_state:
-    st.session_state.user_answers = {}
-if "submitted" not in st.session_state:
-    st.session_state.submitted = False
+# Initialize session state
+if 'questions' not in st.session_state:
+    st.session_state['questions'] = []
+    st.session_state['current_question'] = 0
+    st.session_state['responses'] = []
+    st.session_state['feedback'] = []
+    st.session_state['quit'] = False
 
-# ---- JSON Cleaning Utility ----
-def clean_json_text(text):
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"```(json)?", "", cleaned)
-        cleaned = cleaned.strip("` \n")
-    return cleaned
-
-# ---- Gemini MCQ Generator ----
-def get_mcqs(topic, n=5):
-    prompt = (
-        f"Generate {n} multiple choice questions on the topic '{topic}'. "
-        "Each question should have exactly 4 options labeled A-D and include the correct answer letter only. "
-        "Respond in this JSON format: "
-        "[{'question': '...', 'options': ['A. ...', 'B. ...', 'C. ...', 'D. ...'], 'answer': 'B'}, ...]"
-    )
+# Helper function: Extract text from uploaded PDF
+def extract_text_from_pdf(uploaded_file):
     try:
-        response = model.generate_content(prompt)
-        raw = response.text.strip()
-        cleaned = clean_json_text(raw)
-        return json.loads(cleaned)
+        doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
+        return "\n".join(page.get_text() for page in doc)
     except Exception as e:
-        st.error("❌ Gemini returned an unrecognized format. Try a different topic.")
-        st.text_area("Debug info", raw, height=200)
-        return []
+        st.error(f"Error reading PDF: {e}")
+        return ""
 
-# ---- App Title ----
-st.title("🎯 Mock Interview System")
+# App UI
+st.title("🧠 AI-Powered Behavioral Mock Interview")
+st.write("Start with an introduction and answer behavioral questions one by one. Each question may build on your previous answers.")
 
-# ---- Question Generation ----
-if not st.session_state.questions and not st.session_state.submitted:
-    with st.form("setup"):
-        # User Inputs
-        job_title = st.text_input("📌 Job Title (e.g., Software Engineer)", "Software Engineer")
-        experience_level = st.selectbox("📊 Experience Level", ["Junior", "Mid-level", "Senior"])
-        skills = st.text_input("🛠️ Primary Skills or Technologies (e.g., Python, AWS, React)", "Python, AWS")
-        interview_focus = st.selectbox("🎯 Type of Interview/Focus Area", ["Technical Coding", "System Design", "Behavioral", "Mixed"])
-        topic = st.text_input("📚 Topic for MCQs (e.g., Computer Networks)", "Computer Networks")
-        num_qs = st.slider("🔢 Number of Questions", 3, 10, 5)
-        
-        submitted = st.form_submit_button("Generate Questions")
-        
-        if submitted:
-            # Generating questions based on user input
-            with st.spinner("Generating questions using Gemini..."):
-                prompt = (
-                    f"Generate {num_qs} multiple choice questions for a {experience_level} {job_title} "
-                    f"with expertise in {skills}. The interview should focus on {interview_focus}. "
-                    f"Use the topic '{topic}' and create technical and behavioral questions. "
-                    "Each question should have 4 options labeled A-D and include the correct answer letter only. "
-                    "Respond in this JSON format: "
-                    "[{'question': '...', 'options': ['A. ...', 'B. ...', 'C. ...', 'D. ...'], 'answer': 'B'}, ...]"
-                )
-                st.session_state.questions = get_mcqs(topic, num_qs)
+# User inputs
+job_title = st.text_input("Enter the job title:")
+resume_option = st.radio("How would you like to provide your resume?", ["Paste Text", "Upload PDF"])
+
+resume_text = ""
+if resume_option == "Paste Text":
+    resume_text = st.text_area("Paste your resume text here:")
+else:
+    uploaded_file = st.file_uploader("Upload your resume (PDF)", type="pdf")
+    if uploaded_file:
+        resume_text = extract_text_from_pdf(uploaded_file)
+
+include_job_desc = st.checkbox("Add a job description?")
+job_desc = st.text_area("Paste the job description:") if include_job_desc else "Not provided"
+
+# LangChain prompt template for questions
+question_prompt = PromptTemplate(
+    input_variables=["job_title", "resume", "job_desc", "past_responses"],
+    template="""
+    You are an AI interviewer conducting a behavioral mock interview for the position of {job_title}.
+    The candidate's resume is as follows:
+    {resume}
+
+    Job description:
+    {job_desc}
+
+    Here are the candidate's previous answers:
+    {past_responses}
+
+    Now, ask the next behavioral interview question (1 question only). Start with an introduction question if this is the first.
+    """
+)
+question_chain = LLMChain(llm=llm, prompt=question_prompt)
+
+# LangChain prompt template for feedback
+feedback_prompt = PromptTemplate(
+    input_variables=["question", "answer"],
+    template="""
+    You are an expert interview coach. Given the following interview question and candidate's answer, provide constructive feedback focusing on clarity, relevance, depth, and communication.
+
+    Question: {question}
+    Answer: {answer}
+
+    Feedback:
+    """
+)
+feedback_chain = LLMChain(llm=llm, prompt=feedback_prompt)
+
+# Start Interview
+if st.button("Start Mock Interview"):
+    if not job_title.strip() or not resume_text.strip():
+        st.warning("Please provide both the job title and your resume.")
+    else:
+        st.session_state['questions'] = []
+        st.session_state['responses'] = []
+        st.session_state['feedback'] = []
+        st.session_state['current_question'] = 0
+        st.session_state['quit'] = False
+
+        try:
+            output = question_chain.run(job_title=job_title, resume=resume_text, job_desc=job_desc, past_responses="")
+            st.session_state['questions'].append(output.strip())
             st.rerun()
+        except Exception as e:
+            st.error(f"Error generating question: {e}")
+            st.stop()
 
-# ---- Display Questions ----
-if st.session_state.questions and not st.session_state.submitted:
-    st.header("📝 Answer the Questions Below")
-    for i, q in enumerate(st.session_state.questions):
-        st.write(f"Q{i+1}: {q['question']}")
-        st.session_state.user_answers[i] = st.radio(
-            f"Select your answer for Q{i+1}",
-            options=q["options"],
-            key=f"q{i}"
-        )
-    if st.button("Submit Answers"):
-        st.session_state.submitted = True
+# Display questions and collect responses
+if not st.session_state.get('quit', False) and st.session_state['questions'] and st.session_state['current_question'] < len(st.session_state['questions']):
+    idx = st.session_state['current_question']
+    question = st.session_state['questions'][idx]
+    st.subheader(f"Question {idx + 1}:")
+    st.markdown(question)
+    user_response = st.text_area("Your answer:", key=f"response_{idx}")
+
+    if st.button("Submit Response"):
+        if user_response.strip().lower() in ["quit", "exit"]:
+            st.session_state['quit'] = True
+        elif user_response.strip():
+            st.session_state['responses'].append(user_response.strip())
+
+            try:
+                feedback = feedback_chain.run(question=question, answer=user_response.strip())
+                st.session_state['feedback'].append(feedback.strip())
+            except Exception as e:
+                st.session_state['feedback'].append("Feedback generation failed.")
+                st.error(f"Error generating feedback: {e}")
+
+            past_responses = "\n\n".join([
+                f"Q{i+1}: {st.session_state['questions'][i]}\nA{i+1}: {st.session_state['responses'][i]}"
+                for i in range(len(st.session_state['responses']))
+            ])
+
+            try:
+                next_question = question_chain.run(job_title=job_title, resume=resume_text, job_desc=job_desc, past_responses=past_responses)
+                st.session_state['questions'].append(next_question.strip())
+                st.session_state['current_question'] += 1
+            except Exception as e:
+                st.error(f"Error generating next question: {e}")
+                st.session_state['quit'] = True
         st.rerun()
 
-# ---- Display Results ----
-if st.session_state.submitted:
-    st.header("📊 Your Results")
-    correct_count = 0
-    feedback_prompts = []
+# Completion & Summary
+if st.session_state.get('quit', False) or st.session_state['questions'] and st.session_state['current_question'] >= len(st.session_state['questions']):
+    st.success("✅ Mock interview completed!")
+    for i, (q, a, f) in enumerate(zip(st.session_state['questions'], st.session_state['responses'], st.session_state['feedback']), 1):
+        st.markdown(f"**Q{i}:** {q}")
+        st.markdown(f"**A{i}:** {a}")
+        st.markdown(f"**Feedback {i}:** {f}")
 
-    for i, q in enumerate(st.session_state.questions):
-        correct_letter = q["answer"]
-        correct_option = next(opt for opt in q["options"] if opt.startswith(correct_letter))
-        user_answer = st.session_state.user_answers.get(i, "")
-        is_correct = user_answer.startswith(correct_letter)
+    full_log = "\n\n".join([
+        f"Q{i}: {q}\nA{i}: {a}\nFeedback: {f}"
+        for i, (q, a, f) in enumerate(zip(st.session_state['questions'], st.session_state['responses'], st.session_state['feedback']), 1)
+    ])
+    st.download_button("Download Full Report", full_log, file_name="interview_behavioral_log.txt")
 
-        if is_correct:
-            correct_count += 1
-            st.write(f"✅ Q{i+1}: {q['question']}")
-            st.write(f"Correct! You chose: {user_answer}")
-        else:
-            st.write(f"❌ Q{i+1}: {q['question']}")
-            st.write(f"Incorrect. You chose: {user_answer}. Correct: {correct_option}")
-            feedback_prompts.append(f"Q: {q['question']}\nCorrect Answer: {correct_option}\nExplain why.")
-
-    st.success(f"🎯 Final Score: {correct_count} / {len(st.session_state.questions)}")
-
-    if feedback_prompts and st.button("🧠 Show Explanations"):
-        with st.spinner("Generating feedback..."):
-            explanation_prompt = "\n\n".join(feedback_prompts)
-            explanation = model.generate_content(explanation_prompt)
-            st.subheader("📘 Detailed Explanation")
-            st.write(explanation.text)
-
-    if st.button("🔁 Try Again"):
-        st.session_state.clear()
-        st.rerun()
+# Optional: Button to quit the interview early
+if st.button("End Interview Early"):
+    st.session_state['quit'] = True
+    st.rerun()
